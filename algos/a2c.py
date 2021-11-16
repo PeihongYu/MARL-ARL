@@ -5,12 +5,12 @@ import torch.nn.functional as F
 from algos.base import BaseAlgo
 
 
-class DSAC(BaseAlgo):
+class A2CAlgo(BaseAlgo):
 
     def __init__(self, env, acmodels, priors=None, device=None, num_frames_per_proc=None, discount=0.99, lr=0.01, gae_lambda=0.95,
-                 entropy_coef=0.01, value_loss_coef=0.5, max_grad_norm=0.5, recurrence=1,
+                 entropy_coef=0.01, value_loss_coef=0.5, max_grad_norm=0.5, recurrence=4,
                  rmsprop_alpha=0.99, rmsprop_eps=1e-8, preprocess_obss=None, share_reward=False):
-        num_frames_per_proc = num_frames_per_proc or 8
+        num_frames_per_proc = num_frames_per_proc or 16
 
         super().__init__(env, acmodels, priors, device, num_frames_per_proc, discount, lr, gae_lambda, entropy_coef,
                          value_loss_coef, max_grad_norm, recurrence, preprocess_obss, share_reward)
@@ -57,8 +57,7 @@ class DSAC(BaseAlgo):
 
                 value_loss = (value - sb.returnn).pow(2).mean()
 
-                # loss = policy_loss - self.entropy_coef * entropy + self.value_loss_coef * value_loss
-                loss = policy_loss + self.value_loss_coef * value_loss
+                loss = policy_loss - self.entropy_coef * entropy + self.value_loss_coef * value_loss
 
                 # Update batch values
 

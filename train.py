@@ -1,26 +1,42 @@
 import argparse
 import time
 import datetime
-import torch_ac
 import tensorboardX
 import sys
 
 import utils
 from utils import device
 from algos.DSAC import DSAC
+from algos.ppo import PPOAlgo
+from algos.a2c import A2CAlgo
 from algos.model import ACModel
 
-# Parse arguments
+import numpy as np
+import torch
 
+np.set_printoptions(precision=3)
+
+
+def my_bool(s):
+    return s != 'False'
+
+
+# Parse arguments
 parser = argparse.ArgumentParser()
 
 ## General parameters
-parser.add_argument("--algo", default="DSAC",
-                    help="algorithm to use")
+parser.add_argument("--algo", default="a2c",
+                    help="algorithm to use: a2c | ppo | DSAC")
 parser.add_argument("--env", required=True,
                     help="name of the environment to train on (REQUIRED)")
 parser.add_argument("--model", default=None,
                     help="name of the model (default: {ENV}_{ALGO}_{TIME})")
+parser.add_argument("--obs", default="partial",
+                    help="type of the observation (default: full; other: partial)")
+parser.add_argument("--share-reward", default=True, type=my_bool,
+                    help="whether to share reward or not (default: True)")
+parser.add_argument("--priors", default=None,
+                    help="use which priors: r | g | rg")
 parser.add_argument("--seed", type=int, default=1,
                     help="random seed (default: 1)")
 parser.add_argument("--log-interval", type=int, default=1,
@@ -29,7 +45,7 @@ parser.add_argument("--save-interval", type=int, default=10,
                     help="number of updates between two saves (default: 10, 0 means no saving)")
 parser.add_argument("--procs", type=int, default=16,
                     help="number of processes (default: 16)")
-parser.add_argument("--frames", type=int, default=10**7,
+parser.add_argument("--frames", type=int, default=10 ** 7,
                     help="number of frames of training (default: 1e7)")
 
 ## Parameters for main algorithm
@@ -64,10 +80,15 @@ parser.add_argument("--text", action="store_true", default=False,
 
 args = parser.parse_args()
 
-
 # Set run dir
-date = datetime.datetime.now().strftime("%y-%m-%d-%H-%M-%S")
-default_model_name = f"{args.env}_{args.algo}_seed{args.seed}_{date}"
+# date = datetime.datetime.now().strftime("%y-%m-%d-%H-%M-%S")
+# default_model_name = f"{args.env}_{args.algo}_seed{args.seed}_{date}"
+
+default_model_name = f"{args.env[9:-3]}-{args.obs}-{args.algo}"
+if args.share_reward:
+    default_model_name = default_model_name + "-share"
+if args.priors:
+    default_model_name = default_model_name + "-wprior"
 
 model_name = args.model or default_model_name
 model_dir = utils.get_model_dir(model_name)
@@ -90,7 +111,7 @@ txt_logger.info(f"Device: {device}\n")
 # Load environments
 envs = []
 for i in range(args.procs):
-    envs.append(utils.make_env(args.env, args.seed + 10000 * i))
+    envs.append(utils.make_env(args.env, args.obs, args.seed + 10000 * i))
 txt_logger.info("Environments loaded\n")
 
 # Load training status
@@ -100,31 +121,52 @@ except OSError:
     status = {"num_frames": 0, "update": 0}
 txt_logger.info("Training status loaded\n")
 
-# Load observations preprocessor
+# Load observation preprocessor
 obs_space, preprocess_obss = utils.get_obss_preprocessor(envs[0].observation_space)
-if "vocab" in status:
-    preprocess_obss.vocab.load_vocab(status["vocab"])
-txt_logger.info("Observations preprocessor loaded")
+# obs_space = env.observation_space
+txt_logger.info("Observation space loaded")
 
 # Load model
 agent_num = len(envs[0].agents)
 acmodels = []
-for i in range(agent_num):
-    acmodel = ACModel(obs_space, envs[0].action_space, args.mem, args.text)
+for aid in range(agent_num):
+    acmodel = ACModel(obs_space, envs[0].action_space)
     if "model_state" in status:
-        acmodel.load_state_dict(status["model_state"])
+        acmodel.load_state_dict(status["model_state"][aid])
     acmodel.to(device)
     acmodels.append(acmodel)
     txt_logger.info("Model loaded\n")
     txt_logger.info("{}\n".format(acmodel))
 
 # Load algorithm
-algo = DSAC(envs, acmodels, device, args.frames_per_proc, args.discount, args.lr, args.gae_lambda,
-            args.entropy_coef, args.value_loss_coef, args.max_grad_norm, args.recurrence,
-            args.optim_alpha, args.optim_eps, preprocess_obss)
+prior_names = ["priors/MultiAgent-N2-S4-A1R-full.pt", "priors/MultiAgent-N2-S4-A1G-full.pt"]
+priors = []
+if args.priors == "r":
+    priors.append(torch.load(prior_names[0]))
+elif args.priors == "g":
+    priors.append(torch.load(prior_names[1]))
+elif args.priors == "rg":
+    for prior_name in prior_names:
+        priors.append(torch.load(prior_name))
 
-if "optimizer_state" in status:
-    algo.optimizer.load_state_dict(status["optimizer_state"])
+if args.algo == "DSAC":
+    algo = DSAC(envs, acmodels, priors, device, args.frames_per_proc, args.discount, args.lr, args.gae_lambda,
+                args.entropy_coef, args.value_loss_coef, args.max_grad_norm, args.recurrence,
+                args.optim_alpha, args.optim_eps, preprocess_obss, args.share_reward)
+elif args.algo == "ppo":
+    algo = PPOAlgo(envs, acmodels, priors, device, args.frames_per_proc, args.discount, args.lr, args.gae_lambda,
+                   args.entropy_coef, args.value_loss_coef, args.max_grad_norm, args.recurrence,
+                   args.optim_eps, args.clip_eps, args.epochs, args.batch_size, preprocess_obss, args.share_reward)
+elif args.algo == "a2c":
+    algo = A2CAlgo(envs, acmodels, priors, device, args.frames_per_proc, args.discount, args.lr, args.gae_lambda,
+                   args.entropy_coef, args.value_loss_coef, args.max_grad_norm, args.recurrence,
+                   args.optim_alpha, args.optim_eps, preprocess_obss, args.share_reward)
+else:
+    raise ValueError("Incorrect algorithm name: {}".format(args.algo))
+
+for aid in range(agent_num):
+    if "optimizer_state" in status:
+        algo.optimizers[aid].load_state_dict(status["optimizer_state"][aid])
 txt_logger.info("Optimizer loaded\n")
 
 # Train model
@@ -146,27 +188,31 @@ while num_frames < args.frames:
 
     # Print logs
     if update % args.log_interval == 0:
-        fps = logs["num_frames"]/(update_end_time - update_start_time)
+        fps = logs["num_frames"] / (update_end_time - update_start_time)
         duration = int(time.time() - start_time)
+
         return_per_episode = utils.synthesize(logs["return_per_episode"])
-        rreturn_per_episode = utils.synthesize(logs["reshaped_return_per_episode"])
         num_frames_per_episode = utils.synthesize(logs["num_frames_per_episode"])
 
         header = ["update", "frames", "FPS", "duration"]
         data = [update, num_frames, fps, duration]
-        header += ["rreturn_" + key for key in rreturn_per_episode.keys()]
-        data += rreturn_per_episode.values()
         header += ["num_frames_" + key for key in num_frames_per_episode.keys()]
         data += num_frames_per_episode.values()
-        header += ["entropy", "value", "policy_loss", "value_loss", "grad_norm"]
-        data += [logs["entropy"], logs["value"], logs["policy_loss"], logs["value_loss"], logs["grad_norm"]]
 
-        txt_logger.info(
-            "U {} | F {:06} | FPS {:04.0f} | D {} | rR:μσmM {:.2f} {:.2f} {:.2f} {:.2f} | F:μσmM {:.1f} {:.1f} {} {} | H {:.3f} | V {:.3f} | pL {:.3f} | vL {:.3f} | ∇ {:.3f}"
-            .format(*data))
+        for aid in range(agent_num):
+            color = envs[0].agents[aid].color
 
-        header += ["return_" + key for key in return_per_episode.keys()]
-        data += return_per_episode.values()
+            header += ["return_" + key + "_" + color for key in return_per_episode.keys()]
+            data += [return_per_episode[key][aid] for key in return_per_episode.keys()]
+
+            keys = ["entropy", "value", "policy_loss", "value_loss", "grad_norm"]
+            header += [key + "_" + color for key in keys]
+            data += [logs[key][aid] for key in keys]
+
+        txt_logger.info(("U {} | F {:06} | FPS {:04.0f} | D {} | F:μσmM {:.1f} {:.1f} {:.0f} {:.0f} || " + " || ".join(
+            [envs[0].agents[aid].color +
+             ": rR:μσmM {:.2f} {:.2f} {:.2f} {:.2f} | H {:.3f} | V {:.3f} | pL {:.3f} | vL {:.3f} | ∇ {:.3f}"
+             for aid in range(agent_num)])).format(*data))
 
         if status["num_frames"] == 0:
             csv_logger.writerow(header)
@@ -174,14 +220,13 @@ while num_frames < args.frames:
         csv_file.flush()
 
         for field, value in zip(header, data):
-            tb_writer.add_scalar(field, value, num_frames)
+            tb_writer.add_scalar(field, float(value), num_frames)
 
     # Save status
     if args.save_interval > 0 and update % args.save_interval == 0:
         status = {"num_frames": num_frames, "update": update,
-                  "model_state": acmodel.state_dict(), "optimizer_state": algo.optimizer.state_dict()}
-        if hasattr(preprocess_obss, "vocab"):
-            status["vocab"] = preprocess_obss.vocab.vocab
+                  "model_state": [acmodel.state_dict() for acmodel in acmodels],
+                  "optimizer_state": [optimizer.state_dict() for optimizer in algo.optimizers]}
         utils.save_status(status, model_dir)
         txt_logger.info("Status saved")
 
